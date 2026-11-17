@@ -102,6 +102,13 @@ pub trait VmCircomWitnessExtension<F: PrimeField> {
     /// Returns whether the VM-type represents a shared value (true) or a public one (false).
     fn is_shared(&mut self, a: &Self::VmType) -> Result<bool>;
 
+    /// Returns true if a component that raises a shared value to the public `exponent` runs
+    /// faster interpreted than through a component accelerator. The REP3 VM evaluates inverse
+    /// power maps (`x^(1/5)` and the like) with a masked root, in one opening per value.
+    fn interprets_power(&self, _exponent: &Self::VmType) -> bool {
+        false
+    }
+
     /// Transforms a public field element into a usize if possible.
     fn to_index(&mut self, a: Self::VmType) -> Result<usize>;
 
