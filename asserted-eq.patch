@@ -1,0 +1,107 @@
+diff --git a/co-circom/circom-mpc-vm/src/mpc/rep3.rs b/co-circom/circom-mpc-vm/src/mpc/rep3.rs
+index a5afcbf..77ca843 100644
+--- a/co-circom/circom-mpc-vm/src/mpc/rep3.rs
++++ b/co-circom/circom-mpc-vm/src/mpc/rep3.rs
+@@ -544,6 +544,43 @@ impl<F: PrimeField + FieldUint, N: Network> VmCircomWitnessExtension<F>
+         }
+     }
+ 
++    fn asserted_eq(
++        &mut self,
++        lhs: Vec<Self::VmType>,
++        rhs: Vec<Self::VmType>,
++    ) -> eyre::Result<Self::VmType> {
++        // Direct callers must preserve the same scalar-only boundary as VM dispatch.
++        // A vector assertion reveals one aggregate result, not each coordinate's equality.
++        if lhs.len() != 1 || rhs.len() != 1 {
++            let mut result = self.public_one();
++            for (lhs, rhs) in lhs.into_iter().zip(rhs) {
++                let cmp = self.eq(lhs, rhs)?;
++                result = self.bool_and(cmp, result)?;
++            }
++            return Ok(result);
++        }
++        // Scalar-only fast path: open one freshly masked difference for the asserted equality.
++        let mut equal = true;
++        let mut differences = Vec::new();
++        for (lhs, rhs) in lhs.into_iter().zip(rhs) {
++            match (lhs, rhs) {
++                (Rep3VmType::Public(lhs), Rep3VmType::Public(rhs)) => equal &= lhs == rhs,
++                (lhs, rhs) => {
++                    let difference = self.sub(lhs, rhs)?;
++                    differences.push(self.to_share(difference)?);
++                }
++            }
++        }
++        if !differences.is_empty() {
++            let masks = (0..differences.len())
++                .map(|_| arithmetic::rand(&mut self.state))
++                .collect_vec();
++            let opened = arithmetic::mul_open_vec(&differences, &masks, self.net, &mut self.state)?;
++            equal &= opened.iter().all(|value| value.is_zero());
++        }
++        Ok(Rep3VmType::Public(if equal { F::one() } else { F::zero() }))
++    }
++
+     fn to_index(&mut self, a: Self::VmType) -> eyre::Result<usize> {
+         if let Rep3VmType::Public(a) = a {
+             Ok(to_usize!(a))
+diff --git a/co-circom/circom-mpc-vm/src/mpc.rs b/co-circom/circom-mpc-vm/src/mpc.rs
+index 6bd6239..30c325b 100644
+--- a/co-circom/circom-mpc-vm/src/mpc.rs
++++ b/co-circom/circom-mpc-vm/src/mpc.rs
+@@ -102,6 +102,21 @@ pub trait VmCircomWitnessExtension<F: PrimeField> {
+     /// Returns whether the VM-type represents a shared value (true) or a public one (false).
+     fn is_shared(&mut self, a: &Self::VmType) -> Result<bool>;
+ 
++    /// Element-wise equality of `lhs` and `rhs`, for an `===` constraint that is asserted right
++    /// away. The assertion reveals the result, so a protocol may return it as a public value.
++    fn asserted_eq(
++        &mut self,
++        lhs: Vec<Self::VmType>,
++        rhs: Vec<Self::VmType>,
++    ) -> Result<Self::VmType> {
++        let mut result = self.public_one();
++        for (lhs, rhs) in lhs.into_iter().zip(rhs) {
++            let cmp = self.eq(lhs, rhs)?;
++            result = self.bool_and(cmp, result)?;
++        }
++        Ok(result)
++    }
++
+     /// Transforms a public field element into a usize if possible.
+     fn to_index(&mut self, a: Self::VmType) -> Result<usize>;
+ 
+diff --git a/co-circom/circom-mpc-vm/src/mpc_vm.rs b/co-circom/circom-mpc-vm/src/mpc_vm.rs
+index 4c47306..1415201 100644
+--- a/co-circom/circom-mpc-vm/src/mpc_vm.rs
++++ b/co-circom/circom-mpc-vm/src/mpc_vm.rs
+@@ -671,12 +671,23 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
+                     for _ in 0..size {
+                         lhs.push(self.pop_field());
+                     }
+-                    let mut result = protocol.public_one();
+-                    for (lhs, rhs) in izip!(lhs, rhs) {
+-                        let cmp = protocol.eq(lhs, rhs)?;
+-                        result = protocol.bool_and(cmp, result)?;
++                    // Opening individual vector differences would reveal which coordinates fail.
++                    // Keep vector equality on the secret aggregate path; specialize scalars only.
++                    if size == 1
++                        && matches!(
++                            current_body.get(ip + 1),
++                            Some(op_codes::MpcOpCode::Assert(_))
++                        )
++                    {
++                        self.push_field(protocol.asserted_eq(lhs, rhs)?);
++                    } else {
++                        let mut result = protocol.public_one();
++                        for (lhs, rhs) in izip!(lhs, rhs) {
++                            let cmp = protocol.eq(lhs, rhs)?;
++                            result = protocol.bool_and(cmp, result)?;
++                        }
++                        self.push_field(result);
+                     }
+-                    self.push_field(result);
+                 }
+                 op_codes::MpcOpCode::Neq => {
+                     let rhs = self.pop_field();

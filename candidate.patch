@@ -1,0 +1,381 @@
+diff --git a/co-circom/circom-mpc-vm/src/mpc/rep3/masked_root.rs b/co-circom/circom-mpc-vm/src/mpc/rep3/masked_root.rs
+new file mode 100644
+index 0000000..a5d7026
+--- /dev/null
++++ b/co-circom/circom-mpc-vm/src/mpc/rep3/masked_root.rs
+@@ -0,0 +1,190 @@
++//! Masked-root evaluation of inverse power maps in the REP3 MPC-VM.
++//!
++//! An inverse power map is `x ↦ x^e` with `e·d ≡ 1 (mod p − 1)` for a small public `d`, such as
++//! the inverse S-box `x^(1/5)` of Rescue. Square-and-multiply needs about 1.5·log2(p) sequential
++//! multiplications for it. The masked root of eprint 2019/426 (Appendix C) needs one opening:
++//!
++//! 1. offline, in batches: random shares `[u]`, `[t]`, `[r]`; open `u·t` (uniform), set
++//!    `[u⁻¹] = [t]·(u·t)⁻¹`, compute `[u^d]` with square-and-multiply on the whole batch, and
++//!    convert `[r]` to a binary sharing `[r]_B` with the upstream conversion;
++//! 2. online, a zero test that opens only the uniform `s = x + r`: `x = 0` exactly when the
++//!    bits of `r` equal the public bits of `s`, so `[z] = [x = 0]` is the upstream binary zero
++//!    test of `[r]_B ⊕ s`, injected back into the field;
++//! 3. online: open `c = (x + z)·u^d`; then `x^e = c^e·[u⁻¹] − [z]`.
++//!
++//! `x + z` is never zero, and `u^d` is uniform on the nonzero field elements because `d` is
++//! coprime to `p − 1`, so every opened `c` is a fresh uniform nonzero value whatever `x` is.
++//! The zero test keeps the case `x = 0` from opening as `c = 0`: for `x = 0` the parties compute
++//! `1^e − 1 = 0` without learning that `x` was zero.
++
++use std::{any::Any, cell::RefCell};
++
++use ark_ff::PrimeField;
++use itertools::izip;
++use mpc_core::{
++    protocols::rep3::{
++        Rep3PrimeFieldShare, Rep3State, Rep3UintShare, arithmetic, binary, conversion,
++    },
++    uint::FieldUint,
++};
++use mpc_net::Network;
++
++type Share<F> = Rep3PrimeFieldShare<F>;
++
++/// The largest `d` of an inverse power map evaluated with a masked root.
++const MAX_DEGREE: u64 = 15;
++/// Masks prepared by the first batch of a witness extension; later batches double, up to `MAX_BATCH`.
++const FIRST_BATCH: usize = 128;
++const MAX_BATCH: usize = 1024;
++
++/// Returns `d` with `e·d ≡ 1 (mod p − 1)` and `2 ≤ d ≤ MAX_DEGREE`, if there is one.
++pub(super) fn inverse_degree<F: PrimeField>(e: F) -> Option<u64> {
++    if e.is_zero() {
++        return None;
++    }
++    let e = e.into_bigint();
++    let mut p_minus_1 = F::MODULUS.as_ref().to_vec();
++    // p is odd, so subtracting one never borrows
++    p_minus_1[0] -= 1;
++    (2..=MAX_DEGREE).find(|&d| {
++        // e < p, so e·d = 1 + k·(p − 1) for some k < d exactly when e·d ≡ 1 (mod p − 1)
++        let ed = mul_small(e.as_ref(), d);
++        (0..d).any(|k| {
++            let mut rhs = mul_small(&p_minus_1, k);
++            add_one(&mut rhs);
++            rhs == ed
++        })
++    })
++}
++
++/// `x^e` for a shared `x` when `e` is an inverse power exponent, otherwise `None`.
++pub(super) fn inverse_power<F: PrimeField + FieldUint, N: Network>(
++    x: Share<F>,
++    e: F,
++    net: &N,
++    state: &mut Rep3State,
++) -> eyre::Result<Option<Share<F>>> {
++    let Some(degree) = inverse_degree(e) else {
++        return Ok(None);
++    };
++    let mask = take_mask::<F, N>(degree, net, state)?;
++    let shifted = arithmetic::open(x + mask.offset, net)?;
++    let difference = binary::xor_public(&mask.offset_bits, &shifted.to_uint(), state.id);
++    let is_zero = binary::is_zero(&difference, net, state)?;
++    let is_zero = conversion::bit_inject(&is_zero, net, state)?;
++    let c = arithmetic::mul_open(x + is_zero, mask.power, net, state)?;
++    if c.is_zero() {
++        eyre::bail!("masked root opened zero: the masks are inconsistent between the parties");
++    }
++    let root = arithmetic::mul_public(mask.inverse, c.pow(e.into_bigint()));
++    Ok(Some(root - is_zero))
++}
++
++/// Preprocessed randomness for one inverse power: `[u^d]`, `[u⁻¹]`, `[r]` and `[r]_B`.
++struct Mask<F: FieldUint> {
++    power: Share<F>,
++    inverse: Share<F>,
++    offset: Share<F>,
++    offset_bits: Rep3UintShare<F>,
++}
++
++/// Prepared masks of one REP3 state.
++struct MaskPool<F: FieldUint> {
++    owner: usize,
++    degree: u64,
++    next_batch: usize,
++    masks: Vec<Mask<F>>,
++}
++
++thread_local! {
++    static POOL: RefCell<Option<Box<dyn Any>>> = const { RefCell::new(None) };
++}
++
++fn take_mask<F: FieldUint, N: Network>(
++    degree: u64,
++    net: &N,
++    state: &mut Rep3State,
++) -> eyre::Result<Mask<F>> {
++    let owner = std::ptr::from_ref::<Rep3State>(state) as usize;
++    let mut pool = POOL
++        .with(|cell| cell.borrow_mut().take())
++        .and_then(|pool| pool.downcast::<MaskPool<F>>().ok())
++        .filter(|pool| pool.owner == owner && pool.degree == degree)
++        .unwrap_or_else(|| {
++            Box::new(MaskPool {
++                owner,
++                degree,
++                next_batch: FIRST_BATCH,
++                masks: Vec::new(),
++            })
++        });
++    while pool.masks.is_empty() {
++        let size = pool.next_batch;
++        pool.next_batch = (size * 2).min(MAX_BATCH);
++        pool.masks = prepare_masks(size, degree, net, state)?;
++    }
++    let mask = pool.masks.pop().expect("the pool was refilled");
++    POOL.with(|cell| *cell.borrow_mut() = Some(pool as Box<dyn Any>));
++    Ok(mask)
++}
++
++/// `size` masks for fresh random `u ≠ 0` and `r`, in one opening, the multiplication rounds of
++/// `u^d` and one batched binary conversion.
++fn prepare_masks<F: FieldUint, N: Network>(
++    size: usize,
++    degree: u64,
++    net: &N,
++    state: &mut Rep3State,
++) -> eyre::Result<Vec<Mask<F>>> {
++    let u = (0..size)
++        .map(|_| arithmetic::rand(state))
++        .collect::<Vec<_>>();
++    let t = (0..size)
++        .map(|_| arithmetic::rand(state))
++        .collect::<Vec<Share<F>>>();
++    let r = (0..size)
++        .map(|_| arithmetic::rand(state))
++        .collect::<Vec<Share<F>>>();
++    let r_bits = conversion::a2b_selector_many(&r, net, state)?;
++    let ut = arithmetic::mul_open_vec(&u, &t, net, state)?;
++    let mut power = u.clone();
++    for bit in (0..63 - degree.leading_zeros()).rev() {
++        power = arithmetic::mul_vec(&power, &power, net, state)?;
++        if (degree >> bit) & 1 == 1 {
++            power = arithmetic::mul_vec(&power, &u, net, state)?;
++        }
++    }
++    // u·t = 0 means u = 0 or t = 0; every party sees the same opening and drops the same pairs
++    Ok(izip!(power, t, ut, r, r_bits)
++        .filter_map(|(power, t, ut, offset, offset_bits)| {
++            ut.inverse().map(|inv| Mask {
++                power,
++                inverse: arithmetic::mul_public(t, inv),
++                offset,
++                offset_bits,
++            })
++        })
++        .collect())
++}
++
++fn mul_small(limbs: &[u64], factor: u64) -> Vec<u64> {
++    let mut out = Vec::with_capacity(limbs.len() + 1);
++    let mut carry = 0u128;
++    for &limb in limbs {
++        let product = u128::from(limb) * u128::from(factor) + carry;
++        out.push(product as u64);
++        carry = product >> 64;
++    }
++    out.push(carry as u64);
++    out
++}
++
++fn add_one(limbs: &mut [u64]) {
++    for limb in limbs {
++        let (sum, overflow) = limb.overflowing_add(1);
++        *limb = sum;
++        if !overflow {
++            return;
++        }
++    }
++}
+diff --git a/co-circom/circom-mpc-vm/src/mpc/rep3.rs b/co-circom/circom-mpc-vm/src/mpc/rep3.rs
+index a5afcbf..5cb3cf6 100644
+--- a/co-circom/circom-mpc-vm/src/mpc/rep3.rs
++++ b/co-circom/circom-mpc-vm/src/mpc/rep3.rs
+@@ -27,6 +27,8 @@ fn is_power_of_two<U: UintBackend>(v: &U) -> bool {
+     !v.is_zero() && (*v & v.wrapping_sub(&U::from(1u64))).is_zero()
+ }
+ 
++mod masked_root;
++
+ type ArithmeticShare<F> = Rep3PrimeFieldShare<F>;
+ 
+ /// This type represents a public, arithmetic share, or binary share type used in the co-cricom MPC-VM
+@@ -197,6 +199,9 @@ impl<F: PrimeField + FieldUint, N: Network> VmCircomWitnessExtension<F>
+                 if b.is_zero() {
+                     return Ok(Rep3VmType::Public(F::one()));
+                 }
++                if let Some(root) = masked_root::inverse_power(a, b, self.net, &mut self.state)? {
++                    return Ok(root.into());
++                }
+                 Ok(arithmetic::pow_public(a, b, self.net, &mut self.state)?.into())
+             }
+             _ => todo!("pow with shared exponent not implemented"),
+@@ -544,6 +549,47 @@ impl<F: PrimeField + FieldUint, N: Network> VmCircomWitnessExtension<F>
+         }
+     }
+ 
++    fn interprets_power(&self, exponent: &Self::VmType) -> bool {
++        matches!(exponent, Rep3VmType::Public(e) if masked_root::inverse_degree(*e).is_some())
++    }
++
++    fn asserted_eq(
++        &mut self,
++        lhs: Vec<Self::VmType>,
++        rhs: Vec<Self::VmType>,
++    ) -> eyre::Result<Self::VmType> {
++        // Direct callers must preserve the same scalar-only boundary as VM dispatch.
++        // A vector assertion reveals one aggregate result, not each coordinate's equality.
++        if lhs.len() != 1 || rhs.len() != 1 {
++            let mut result = self.public_one();
++            for (lhs, rhs) in lhs.into_iter().zip(rhs) {
++                let cmp = self.eq(lhs, rhs)?;
++                result = self.bool_and(cmp, result)?;
++            }
++            return Ok(result);
++        }
++        // Scalar-only fast path: open one freshly masked difference for the asserted equality.
++        let mut equal = true;
++        let mut differences = Vec::new();
++        for (lhs, rhs) in lhs.into_iter().zip(rhs) {
++            match (lhs, rhs) {
++                (Rep3VmType::Public(lhs), Rep3VmType::Public(rhs)) => equal &= lhs == rhs,
++                (lhs, rhs) => {
++                    let difference = self.sub(lhs, rhs)?;
++                    differences.push(self.to_share(difference)?);
++                }
++            }
++        }
++        if !differences.is_empty() {
++            let masks = (0..differences.len())
++                .map(|_| arithmetic::rand(&mut self.state))
++                .collect_vec();
++            let opened = arithmetic::mul_open_vec(&differences, &masks, self.net, &mut self.state)?;
++            equal &= opened.iter().all(|value| value.is_zero());
++        }
++        Ok(Rep3VmType::Public(if equal { F::one() } else { F::zero() }))
++    }
++
+     fn to_index(&mut self, a: Self::VmType) -> eyre::Result<usize> {
+         if let Rep3VmType::Public(a) = a {
+             Ok(to_usize!(a))
+diff --git a/co-circom/circom-mpc-vm/src/mpc.rs b/co-circom/circom-mpc-vm/src/mpc.rs
+index 6bd6239..7dd2ad8 100644
+--- a/co-circom/circom-mpc-vm/src/mpc.rs
++++ b/co-circom/circom-mpc-vm/src/mpc.rs
+@@ -102,6 +102,28 @@ pub trait VmCircomWitnessExtension<F: PrimeField> {
+     /// Returns whether the VM-type represents a shared value (true) or a public one (false).
+     fn is_shared(&mut self, a: &Self::VmType) -> Result<bool>;
+ 
++    /// Returns true if a component that raises a shared value to the public `exponent` runs
++    /// faster interpreted than through a component accelerator. The REP3 VM evaluates inverse
++    /// power maps (`x^(1/5)` and the like) with a masked root, in one opening per value.
++    fn interprets_power(&self, _exponent: &Self::VmType) -> bool {
++        false
++    }
++
++    /// Element-wise equality of `lhs` and `rhs`, for an `===` constraint that is asserted right
++    /// away. The assertion reveals the result, so a protocol may return it as a public value.
++    fn asserted_eq(
++        &mut self,
++        lhs: Vec<Self::VmType>,
++        rhs: Vec<Self::VmType>,
++    ) -> Result<Self::VmType> {
++        let mut result = self.public_one();
++        for (lhs, rhs) in lhs.into_iter().zip(rhs) {
++            let cmp = self.eq(lhs, rhs)?;
++            result = self.bool_and(cmp, result)?;
++        }
++        Ok(result)
++    }
++
+     /// Transforms a public field element into a usize if possible.
+     fn to_index(&mut self, a: Self::VmType) -> Result<usize>;
+ 
+diff --git a/co-circom/circom-mpc-vm/src/mpc_vm.rs b/co-circom/circom-mpc-vm/src/mpc_vm.rs
+index 4c47306..b6b408e 100644
+--- a/co-circom/circom-mpc-vm/src/mpc_vm.rs
++++ b/co-circom/circom-mpc-vm/src/mpc_vm.rs
+@@ -310,6 +310,39 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
+             tracing::info!("{idx:0>4}|   {inst}");
+         }
+     }
++
++    /// Whether `body`, or a function or subcomponent it calls, raises a value to a constant
++    /// exponent that the protocol evaluates faster interpreted
++    /// ([`VmCircomWitnessExtension::interprets_power`]).
++    fn computes_interpreted_power(
++        protocol: &C,
++        ctx: &WitnessExtensionCtx<F, C>,
++        body: &CodeBlock,
++        depth: usize,
++    ) -> bool {
++        let raises = body
++            .iter()
++            .any(|inst| matches!(inst, op_codes::MpcOpCode::Pow));
++        body.iter().any(|inst| match inst {
++            op_codes::MpcOpCode::PushConstant(index) => {
++                raises && protocol.interprets_power(&ctx.constant_table[*index])
++            }
++            op_codes::MpcOpCode::Call(symbol, _) => {
++                depth < 8
++                    && ctx.fun_decls.get(symbol).is_some_and(|fun| {
++                        Self::computes_interpreted_power(protocol, ctx, &fun.body, depth + 1)
++                    })
++            }
++            op_codes::MpcOpCode::CreateCmp(symbol, _) => {
++                depth < 8
++                    && ctx.templ_decls.get(symbol).is_some_and(|templ| {
++                        Self::computes_interpreted_power(protocol, ctx, &templ.body, depth + 1)
++                    })
++            }
++            _ => false,
++        })
++    }
++
+     pub fn run(
+         &mut self,
+         protocol: &mut C,
+@@ -328,6 +361,7 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
+         if ctx
+             .mpc_accelerator
+             .has_cmp_accelerator(&self.component_name)
++            && !Self::computes_interpreted_power(protocol, ctx, &self.component_body, 0)
+             && !(self.component_name == "Poseidon2"
+                 && (self.input_signals == 8 || self.input_signals == 12 || self.input_signals > 16))
+         // only state sizes 2,3,4,16 supported yet
+@@ -671,12 +705,23 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
+                     for _ in 0..size {
+                         lhs.push(self.pop_field());
+                     }
+-                    let mut result = protocol.public_one();
+-                    for (lhs, rhs) in izip!(lhs, rhs) {
+-                        let cmp = protocol.eq(lhs, rhs)?;
+-                        result = protocol.bool_and(cmp, result)?;
++                    // Opening individual vector differences would reveal which coordinates fail.
++                    // Keep vector equality on the secret aggregate path; specialize scalars only.
++                    if size == 1
++                        && matches!(
++                            current_body.get(ip + 1),
++                            Some(op_codes::MpcOpCode::Assert(_))
++                        )
++                    {
++                        self.push_field(protocol.asserted_eq(lhs, rhs)?);
++                    } else {
++                        let mut result = protocol.public_one();
++                        for (lhs, rhs) in izip!(lhs, rhs) {
++                            let cmp = protocol.eq(lhs, rhs)?;
++                            result = protocol.bool_and(cmp, result)?;
++                        }
++                        self.push_field(result);
+                     }
+-                    self.push_field(result);
+                 }
+                 op_codes::MpcOpCode::Neq => {
+                     let rhs = self.pop_field();
