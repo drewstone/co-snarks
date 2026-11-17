@@ -310,6 +310,39 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
             tracing::info!("{idx:0>4}|   {inst}");
         }
     }
+
+    /// Whether `body`, or a function or subcomponent it calls, raises a value to a constant
+    /// exponent that the protocol evaluates faster interpreted
+    /// ([`VmCircomWitnessExtension::interprets_power`]).
+    fn computes_interpreted_power(
+        protocol: &C,
+        ctx: &WitnessExtensionCtx<F, C>,
+        body: &CodeBlock,
+        depth: usize,
+    ) -> bool {
+        let raises = body
+            .iter()
+            .any(|inst| matches!(inst, op_codes::MpcOpCode::Pow));
+        body.iter().any(|inst| match inst {
+            op_codes::MpcOpCode::PushConstant(index) => {
+                raises && protocol.interprets_power(&ctx.constant_table[*index])
+            }
+            op_codes::MpcOpCode::Call(symbol, _) => {
+                depth < 8
+                    && ctx.fun_decls.get(symbol).is_some_and(|fun| {
+                        Self::computes_interpreted_power(protocol, ctx, &fun.body, depth + 1)
+                    })
+            }
+            op_codes::MpcOpCode::CreateCmp(symbol, _) => {
+                depth < 8
+                    && ctx.templ_decls.get(symbol).is_some_and(|templ| {
+                        Self::computes_interpreted_power(protocol, ctx, &templ.body, depth + 1)
+                    })
+            }
+            _ => false,
+        })
+    }
+
     pub fn run(
         &mut self,
         protocol: &mut C,
@@ -328,6 +361,7 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
         if ctx
             .mpc_accelerator
             .has_cmp_accelerator(&self.component_name)
+            && !Self::computes_interpreted_power(protocol, ctx, &self.component_body, 0)
             && !(self.component_name == "Poseidon2"
                 && (self.input_signals == 8 || self.input_signals == 12 || self.input_signals > 16))
         // only state sizes 2,3,4,16 supported yet
@@ -671,12 +705,23 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
                     for _ in 0..size {
                         lhs.push(self.pop_field());
                     }
-                    let mut result = protocol.public_one();
-                    for (lhs, rhs) in izip!(lhs, rhs) {
-                        let cmp = protocol.eq(lhs, rhs)?;
-                        result = protocol.bool_and(cmp, result)?;
+                    // Opening individual vector differences would reveal which coordinates fail.
+                    // Keep vector equality on the secret aggregate path; specialize scalars only.
+                    if size == 1
+                        && matches!(
+                            current_body.get(ip + 1),
+                            Some(op_codes::MpcOpCode::Assert(_))
+                        )
+                    {
+                        self.push_field(protocol.asserted_eq(lhs, rhs)?);
+                    } else {
+                        let mut result = protocol.public_one();
+                        for (lhs, rhs) in izip!(lhs, rhs) {
+                            let cmp = protocol.eq(lhs, rhs)?;
+                            result = protocol.bool_and(cmp, result)?;
+                        }
+                        self.push_field(result);
                     }
-                    self.push_field(result);
                 }
                 op_codes::MpcOpCode::Neq => {
                     let rhs = self.pop_field();

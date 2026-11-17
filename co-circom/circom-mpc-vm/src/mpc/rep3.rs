@@ -27,6 +27,8 @@ fn is_power_of_two<U: UintBackend>(v: &U) -> bool {
     !v.is_zero() && (*v & v.wrapping_sub(&U::from(1u64))).is_zero()
 }
 
+mod masked_root;
+
 type ArithmeticShare<F> = Rep3PrimeFieldShare<F>;
 
 /// This type represents a public, arithmetic share, or binary share type used in the co-cricom MPC-VM
@@ -196,6 +198,9 @@ impl<F: PrimeField + FieldUint, N: Network> VmCircomWitnessExtension<F>
             (Rep3VmType::Arithmetic(a), Rep3VmType::Public(b)) => {
                 if b.is_zero() {
                     return Ok(Rep3VmType::Public(F::one()));
+                }
+                if let Some(root) = masked_root::inverse_power(a, b, self.net, &mut self.state)? {
+                    return Ok(root.into());
                 }
                 Ok(arithmetic::pow_public(a, b, self.net, &mut self.state)?.into())
             }
@@ -542,6 +547,47 @@ impl<F: PrimeField + FieldUint, N: Network> VmCircomWitnessExtension<F>
             Rep3VmType::Public(_) => Ok(false),
             Rep3VmType::Arithmetic(_) => Ok(true),
         }
+    }
+
+    fn interprets_power(&self, exponent: &Self::VmType) -> bool {
+        matches!(exponent, Rep3VmType::Public(e) if masked_root::inverse_degree(*e).is_some())
+    }
+
+    fn asserted_eq(
+        &mut self,
+        lhs: Vec<Self::VmType>,
+        rhs: Vec<Self::VmType>,
+    ) -> eyre::Result<Self::VmType> {
+        // Direct callers must preserve the same scalar-only boundary as VM dispatch.
+        // A vector assertion reveals one aggregate result, not each coordinate's equality.
+        if lhs.len() != 1 || rhs.len() != 1 {
+            let mut result = self.public_one();
+            for (lhs, rhs) in lhs.into_iter().zip(rhs) {
+                let cmp = self.eq(lhs, rhs)?;
+                result = self.bool_and(cmp, result)?;
+            }
+            return Ok(result);
+        }
+        // Scalar-only fast path: open one freshly masked difference for the asserted equality.
+        let mut equal = true;
+        let mut differences = Vec::new();
+        for (lhs, rhs) in lhs.into_iter().zip(rhs) {
+            match (lhs, rhs) {
+                (Rep3VmType::Public(lhs), Rep3VmType::Public(rhs)) => equal &= lhs == rhs,
+                (lhs, rhs) => {
+                    let difference = self.sub(lhs, rhs)?;
+                    differences.push(self.to_share(difference)?);
+                }
+            }
+        }
+        if !differences.is_empty() {
+            let masks = (0..differences.len())
+                .map(|_| arithmetic::rand(&mut self.state))
+                .collect_vec();
+            let opened = arithmetic::mul_open_vec(&differences, &masks, self.net, &mut self.state)?;
+            equal &= opened.iter().all(|value| value.is_zero());
+        }
+        Ok(Rep3VmType::Public(if equal { F::one() } else { F::zero() }))
     }
 
     fn to_index(&mut self, a: Self::VmType) -> eyre::Result<usize> {
