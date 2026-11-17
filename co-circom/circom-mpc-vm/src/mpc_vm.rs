@@ -671,12 +671,23 @@ impl<F: PrimeField, C: VmCircomWitnessExtension<F>> Component<F, C> {
                     for _ in 0..size {
                         lhs.push(self.pop_field());
                     }
-                    let mut result = protocol.public_one();
-                    for (lhs, rhs) in izip!(lhs, rhs) {
-                        let cmp = protocol.eq(lhs, rhs)?;
-                        result = protocol.bool_and(cmp, result)?;
+                    // Opening individual vector differences would reveal which coordinates fail.
+                    // Keep vector equality on the secret aggregate path; specialize scalars only.
+                    if size == 1
+                        && matches!(
+                            current_body.get(ip + 1),
+                            Some(op_codes::MpcOpCode::Assert(_))
+                        )
+                    {
+                        self.push_field(protocol.asserted_eq(lhs, rhs)?);
+                    } else {
+                        let mut result = protocol.public_one();
+                        for (lhs, rhs) in izip!(lhs, rhs) {
+                            let cmp = protocol.eq(lhs, rhs)?;
+                            result = protocol.bool_and(cmp, result)?;
+                        }
+                        self.push_field(result);
                     }
-                    self.push_field(result);
                 }
                 op_codes::MpcOpCode::Neq => {
                     let rhs = self.pop_field();

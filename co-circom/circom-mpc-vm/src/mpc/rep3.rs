@@ -544,6 +544,43 @@ impl<F: PrimeField + FieldUint, N: Network> VmCircomWitnessExtension<F>
         }
     }
 
+    fn asserted_eq(
+        &mut self,
+        lhs: Vec<Self::VmType>,
+        rhs: Vec<Self::VmType>,
+    ) -> eyre::Result<Self::VmType> {
+        // Direct callers must preserve the same scalar-only boundary as VM dispatch.
+        // A vector assertion reveals one aggregate result, not each coordinate's equality.
+        if lhs.len() != 1 || rhs.len() != 1 {
+            let mut result = self.public_one();
+            for (lhs, rhs) in lhs.into_iter().zip(rhs) {
+                let cmp = self.eq(lhs, rhs)?;
+                result = self.bool_and(cmp, result)?;
+            }
+            return Ok(result);
+        }
+        // Scalar-only fast path: open one freshly masked difference for the asserted equality.
+        let mut equal = true;
+        let mut differences = Vec::new();
+        for (lhs, rhs) in lhs.into_iter().zip(rhs) {
+            match (lhs, rhs) {
+                (Rep3VmType::Public(lhs), Rep3VmType::Public(rhs)) => equal &= lhs == rhs,
+                (lhs, rhs) => {
+                    let difference = self.sub(lhs, rhs)?;
+                    differences.push(self.to_share(difference)?);
+                }
+            }
+        }
+        if !differences.is_empty() {
+            let masks = (0..differences.len())
+                .map(|_| arithmetic::rand(&mut self.state))
+                .collect_vec();
+            let opened = arithmetic::mul_open_vec(&differences, &masks, self.net, &mut self.state)?;
+            equal &= opened.iter().all(|value| value.is_zero());
+        }
+        Ok(Rep3VmType::Public(if equal { F::one() } else { F::zero() }))
+    }
+
     fn to_index(&mut self, a: Self::VmType) -> eyre::Result<usize> {
         if let Rep3VmType::Public(a) = a {
             Ok(to_usize!(a))

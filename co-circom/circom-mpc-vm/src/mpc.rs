@@ -102,6 +102,21 @@ pub trait VmCircomWitnessExtension<F: PrimeField> {
     /// Returns whether the VM-type represents a shared value (true) or a public one (false).
     fn is_shared(&mut self, a: &Self::VmType) -> Result<bool>;
 
+    /// Element-wise equality of `lhs` and `rhs`, for an `===` constraint that is asserted right
+    /// away. The assertion reveals the result, so a protocol may return it as a public value.
+    fn asserted_eq(
+        &mut self,
+        lhs: Vec<Self::VmType>,
+        rhs: Vec<Self::VmType>,
+    ) -> Result<Self::VmType> {
+        let mut result = self.public_one();
+        for (lhs, rhs) in lhs.into_iter().zip(rhs) {
+            let cmp = self.eq(lhs, rhs)?;
+            result = self.bool_and(cmp, result)?;
+        }
+        Ok(result)
+    }
+
     /// Transforms a public field element into a usize if possible.
     fn to_index(&mut self, a: Self::VmType) -> Result<usize>;
 
